@@ -1,0 +1,91 @@
+name: GHCR Image
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ghcr-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/helm-charts-oci-proxy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Log in to ghcr.io
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+      - name: Resolve tags
+        id: tags
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          # Branch names may contain '/', which is not valid inside an image tag.
+          slug=$(printf '%s' "${REF_NAME}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')
+          if [ "${REF_TYPE}" = "tag" ]; then
+            tags="${slug},latest"
+          else
+            tags="${slug},${slug}-${sha:0:7}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        env:
+          VERSION: ${{ steps.tags.outputs.version }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          args=()
+          IFS=',' read -ra tags <<<"${TAGS}"
+          for tag in "${tags[@]}"; do
+            args+=(-t "${IMAGE}:${tag}")
+          done
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            --provenance=false \
+            --sbom=false \
+            --build-arg VERSION="${VERSION}" \
+            --metadata-file /tmp/build-metadata.json \
+            "${args[@]}" \
+            .
+      - name: Summary
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          digest=$(jq -r '."containerimage.digest"' /tmp/build-metadata.json)
+          {
+            echo "### GHCR image"
+            echo
+            echo "Digest: \`${digest}\`"
+            echo
+            echo '```sh'
+            IFS=',' read -ra tags <<<"${TAGS}"
+            for tag in "${tags[@]}"; do
+              echo "docker pull ${IMAGE}:${tag}"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
